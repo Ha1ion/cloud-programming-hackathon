@@ -1,0 +1,4 @@
+Flask==3.0.3
+line-bot-sdk==3.5.0
+python-dotenv==1.0.1
+requests==2.31.0
