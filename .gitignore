@@ -5,5 +5,13 @@ __pycache__/
 venv/
 env/
 .env
+*.env
 .DS_Store
 Thumbs.db
+certs/
+**/certs/
+*.pem
+*.key
+*.crt
+*.log
+logs/
