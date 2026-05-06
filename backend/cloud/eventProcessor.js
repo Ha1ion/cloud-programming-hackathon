@@ -7,36 +7,15 @@ const db = DynamoDBDocumentClient.from(client);
 
 exports.handler = async (event) => {
     try {
-        console.log("Raw IoT Event:", JSON.stringify(event));
-        
-        // 1. Parsing Data (Menangani input dari IoT Core atau Test Console)
+        // 1. Ambil data yang sudah jadi (sudah berupa angka skalar)
         const body = typeof event.body === "string" ? JSON.parse(event.body) : event;
-        
-        // Ambil data berdasarkan struktur baru dari temanmu
-        const deviceId = body.device_id || body.deviceId; 
-        const accelRaw = body.accel;
-        const gyroRaw = body.gyro;
+        const { deviceId, acceleration, tilt, gyro } = body;
 
-        if (!deviceId || !accelRaw) {
-            return { statusCode: 400, body: "Missing device_id or accel data" };
-        }
+        if (!deviceId) return { statusCode: 400, body: "Missing deviceId" };
 
-        // 2. Kalkulasi Nilai Fisik
-        // Acceleration Resultant: sqrt(x^2 + y^2 + z^2)
-        const acceleration = Math.sqrt(
-            Math.pow(accelRaw.x, 2) + Math.pow(accelRaw.y, 2) + Math.pow(accelRaw.z, 2)
-        ) * 9.8; // Konversi ke m/s^2
+        console.log(`Input Data - Device: ${deviceId}, Accel: ${acceleration}, Tilt: ${tilt}`);
 
-        // Tilt (Kemiringan): Menghitung sudut terhadap sumbu Z
-        const totalG = Math.sqrt(Math.pow(accelRaw.x, 2) + Math.pow(accelRaw.y, 2) + Math.pow(accelRaw.z, 2));
-        const tilt = Math.acos(accelRaw.z / totalG) * (180 / Math.PI);
-
-        // Gyro Magnitude
-        const gyro = gyroRaw ? Math.sqrt(Math.pow(gyroRaw.x, 2) + Math.pow(gyroRaw.y, 2) + Math.pow(gyroRaw.z, 2)) : 0;
-
-        console.log(`Processed -> Accel: ${acceleration.toFixed(2)}, Tilt: ${tilt.toFixed(2)}`);
-
-        // 3. Ambil data terakhir dari DynamoDB untuk cek status sebelumnya
+        // 2. Ambil data terakhir untuk cek status kejadian sebelumnya
         const prevData = await db.send(new QueryCommand({
             TableName: "events",
             IndexName: "deviceId-index",
@@ -48,7 +27,7 @@ exports.handler = async (event) => {
 
         const lastItem = prevData.Items?.[0];
         
-        // 4. Algoritma Deteksi
+        // 3. Tentukan Status Berdasarkan Nilai Jadi
         let currentStatus = (acceleration > 12 || tilt > 50) ? "SUSPICIOUS" : "SAFE";
         let alertStatus = currentStatus === "SUSPICIOUS" ? "PENDING" : "NONE";
         
@@ -56,19 +35,18 @@ exports.handler = async (event) => {
         let shouldUpdateLastItem = false;
 
         if (currentStatus === "SUSPICIOUS") {
-            // A. KEJADIAN BARU (Sebelumnya aman atau tidak ada data)
+            // A. Kejadian Baru
             if (!lastItem || lastItem.alertStatus === "NONE" || lastItem.alertStatus === "CANCELLED") {
-                console.log("Kondisi: Suspicious baru terdeteksi.");
                 try {
                     await sendLineBroadcast(`🚨 【警報】偵測到疑似事故！\n請回報您的安全狀態，否則系統將在 90 秒後自動通報。`);
                 } catch (e) { console.error("LINE Error:", e.message); }
             } 
-            // B. LANJUTAN KEJADIAN (Sedang dalam masa tunggu 90 detik)
+            // B. Melanjutkan Kejadian PENDING (Menghitung 90 detik)
             else if (lastItem.alertStatus === "PENDING") {
-                targetTimestamp = lastItem.timestamp; // KUNCI TIMESTAMP LAMA
+                targetTimestamp = lastItem.timestamp; // <--- KUNCI TIMESTAMP AWAL
                 const secondsPassed = (Date.now() - targetTimestamp) / 1000;
                 
-                console.log(`Masa tunggu: ${secondsPassed.toFixed(0)} detik.`);
+                console.log(`Elapsed Time: ${secondsPassed.toFixed(0)}s`);
 
                 if (secondsPassed > 90) { 
                     currentStatus = "EMERGENCY";
@@ -78,19 +56,19 @@ exports.handler = async (event) => {
                         await sendLineBroadcast("🚨 【緊急通報】使用者 90 秒內未回應，系統已自動通報校安中心！");
                     } catch (e) {}
                 } else {
-                    // Masih dalam 90 detik, update data sensor saja
+                    // Masih dalam masa tunggu, update nilai sensor terbaru ke baris yang sama
                     shouldUpdateLastItem = true;
                 }
             }
-            // C. SUDAH EMERGENCY (Abaikan data sensor selanjutnya agar tidak nyampah)
+            // C. Sudah Terkunci di EMERGENCY
             else if (lastItem.alertStatus === "ALERTED") {
                 return { statusCode: 200, body: "Status locked in EMERGENCY" };
             }
         }
 
-        // 5. SIMPAN / UPDATE KE DYNAMODB
+        // 4. Simpan atau Update ke DynamoDB
         if (shouldUpdateLastItem && lastItem) {
-            // UPDATE: Gunakan ID yang sama agar tidak dobel
+            // Update Baris yang Sama (Data sensor terbaru masuk, tapi timestamp tetap lama)
             await db.send(new UpdateCommand({
                 TableName: "events",
                 Key: { eventId: lastItem.eventId },
@@ -99,28 +77,28 @@ exports.handler = async (event) => {
                 ExpressionAttributeValues: {
                     ":s": currentStatus,
                     ":a": alertStatus,
-                    ":acc": acceleration,
-                    ":t": tilt,
-                    ":g": gyro
+                    ":acc": acceleration || 0,
+                    ":t": tilt || 0,
+                    ":g": gyro || 0
                 }
             }));
-            console.log("Existing item updated.");
+            console.log("Updated existing incident record.");
         } else {
-            // PUT: Buat baris baru (untuk SAFE atau awal SUSPICIOUS)
+            // Buat Baris Baru (Jika SAFE atau awal mula SUSPICIOUS)
             await db.send(new PutCommand({
                 TableName: "events",
                 Item: {
                     eventId: `evt-${Date.now()}`,
                     deviceId,
-                    acceleration,
-                    tilt,
-                    gyro,
+                    acceleration: acceleration || 0,
+                    tilt: tilt || 0,
+                    gyro: gyro || 0,
                     status: currentStatus,
                     alertStatus: alertStatus,
-                    timestamp: targetTimestamp // Timestamp awal kecelakaan
+                    timestamp: targetTimestamp // Menyimpan waktu awal kejadian
                 }
             }));
-            console.log("New item created.");
+            console.log("New record created.");
         }
 
         return { 
@@ -129,7 +107,7 @@ exports.handler = async (event) => {
         };
 
     } catch (err) {
-        console.error("Global Error:", err);
+        console.error("Critical Error:", err);
         return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
     }
 };
