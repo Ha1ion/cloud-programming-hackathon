@@ -7,4 +7,12 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  server: {
+    proxy: {
+      '/events': {
+        target: 'http://ec2-3-27-62-158.ap-southeast-2.compute.amazonaws.com',
+        changeOrigin: true,
+      },
+    },
+  },
 })
